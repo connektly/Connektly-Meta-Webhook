@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Connektly | Meta Webhook Event Tracker</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="bg-glow"></div>
+    <main class="container">
+      <header class="hero card">
+        <p class="eyebrow">Connektly SaaS Platform</p>
+        <h1>Meta Webhook Callback URL Server</h1>
+        <p class="subtitle">Monitor Ads, Apps, WhatsApp, Leads, Pages, Instagram and Messenger webhook flows in a single control plane.</p>
+        <div class="meta-row">
+          <span id="serverStatus" class="badge">Checking server...</span>
+          <span id="lastRefresh" class="badge secondary">Last refresh: --</span>
+          <span id="eventsAccepted" class="badge secondary">Events accepted: 0</span>
+        </div>
+      </header>
+
+      <section class="stats-grid" id="statsGrid"></section>
+
+      <section class="layout">
+        <article class="card panel">
+          <div class="panel-head">
+            <h2>Recent Events</h2>
+            <div class="actions">
+              <select id="typeFilter"></select>
+              <select id="sourceFilter"></select>
+              <button id="refreshBtn">Refresh</button>
+            </div>
+          </div>
+          <div id="eventList" class="event-list"></div>
+        </article>
+
+        <article class="card panel">
+          <div class="panel-head">
+            <h2>Payload Inspector</h2>
+          </div>
+          <pre id="payloadPreview" class="payload">Click an event to inspect payload.</pre>
+        </article>
+      </section>
+    </main>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

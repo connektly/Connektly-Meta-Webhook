@@ -1,0 +1,27 @@
+{
+  "name": "connektly-meta-webhook-server",
+  "version": "1.0.0",
+  "description": "Webhook callback URL server and event dashboard for Meta integrations.",
+  "main": "src/server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "check": "node --check src/server.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "firebase-admin": "^13.7.0"
+  },
+  "keywords": [
+    "meta",
+    "webhook",
+    "whatsapp",
+    "instagram",
+    "messenger",
+    "leads",
+    "ads"
+  ],
+  "author": "connektly",
+  "license": "MIT"
+}
