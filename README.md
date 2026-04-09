@@ -31,6 +31,13 @@ A production-ready starter for **Connektly** to receive Meta webhooks and monito
 - REST APIs:
   - `GET /api/events?type=&source=&limit=`
   - `GET /api/stats`
+  - `GET /api/health`
+  - `POST /api/wa/credentials`
+  - `DELETE /api/wa/credentials`
+  - `POST /api/wa/embedded-signup`
+  - `GET /api/wa-media/:mediaId/download`
+  - `ALL /api/wa/*`
+  - `WS /ws`
   - `GET /health`
 
 ## Quick start

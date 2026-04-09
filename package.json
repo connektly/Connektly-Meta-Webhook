@@ -11,7 +11,8 @@
   },
   "dependencies": {
     "dotenv": "^17.2.3",
-    "firebase-admin": "^13.7.0"
+    "firebase-admin": "^13.7.0",
+    "ws": "^8.18.3"
   },
   "keywords": [
     "meta",

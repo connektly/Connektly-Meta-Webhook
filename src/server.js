@@ -6,10 +6,13 @@ import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
 import admin from "firebase-admin";
 import { getFirestore } from "firebase-admin/firestore";
+import { WebSocketServer } from "ws";
 
 const PORT = Number(process.env.PORT || 8080);
 const APP_SECRET = process.env.META_APP_SECRET || "";
 const MAX_EVENTS = Number(process.env.MAX_EVENTS || 1000);
+const GRAPH_VERSION = process.env.META_GRAPH_VERSION || "v25.0";
+const WORKSPACE_SECRETS_COLLECTION = "workspaceSecrets";
 const WEBHOOK_PATHS = new Set(["/meta/webhook", "/api/wa/webhook", "/api/whatsapp/webhook", "/webhook"]);
 
 const __filename = fileURLToPath(import.meta.url);
@@ -55,6 +58,103 @@ function phonesMatch(left, right) {
 
 function normalizeCallEventToken(value) {
   return String(value || "").toLowerCase().replace(/[\s-]+/g, "_");
+}
+
+function getRequestAccessToken(authorizationHeader) {
+  const rawValue = Array.isArray(authorizationHeader) ? authorizationHeader[0] : authorizationHeader;
+  return String(rawValue || "").replace(/^Bearer\s+/i, "").trim();
+}
+
+function normalizeStoredWhatsappConnection(raw) {
+  const phoneNumberId = String(raw?.phoneNumberId || "").trim();
+  const businessAccountId = String(raw?.businessAccountId || raw?.wabaId || "").trim();
+
+  if (!phoneNumberId && !businessAccountId) {
+    return null;
+  }
+
+  return {
+    ...(phoneNumberId ? { phoneNumberId } : {}),
+    ...(businessAccountId ? { businessAccountId } : {})
+  };
+}
+
+function getWorkspaceSecretRef(userId) {
+  return db.collection(WORKSPACE_SECRETS_COLLECTION).doc(userId);
+}
+
+async function saveWorkspaceWhatsappSecret(userId, accessToken) {
+  await getWorkspaceSecretRef(userId).set({
+    whatsapp: {
+      accessToken,
+      updatedAt: new Date().toISOString()
+    }
+  }, { merge: true });
+}
+
+async function clearWorkspaceWhatsappSecret(userId) {
+  await getWorkspaceSecretRef(userId).delete();
+}
+
+async function getWorkspaceWhatsappAccessToken(userId) {
+  const secretSnapshot = await getWorkspaceSecretRef(userId).get();
+  const storedAccessToken = String(secretSnapshot.data()?.whatsapp?.accessToken || "").trim();
+  if (storedAccessToken) {
+    return storedAccessToken;
+  }
+
+  const userSnapshot = await db.collection("users").doc(userId).get();
+  const userData = userSnapshot.data() || {};
+  const legacyAccessToken = String(userData?.whatsappCredentials?.accessToken || "").trim();
+  if (!legacyAccessToken) {
+    return "";
+  }
+
+  await saveWorkspaceWhatsappSecret(userId, legacyAccessToken);
+  const sanitizedConnection = normalizeStoredWhatsappConnection(userData?.whatsappCredentials);
+  await userSnapshot.ref.set({
+    whatsappCredentials: sanitizedConnection || admin.firestore.FieldValue.delete()
+  }, { merge: true });
+  return legacyAccessToken;
+}
+
+async function requireAuthenticatedUser(req, res) {
+  if (!db) {
+    sendJson(res, 503, { error: "Firebase Admin is not configured for authenticated API requests." });
+    return null;
+  }
+
+  const idToken = getRequestAccessToken(req.headers.authorization);
+  if (!idToken) {
+    sendJson(res, 401, { error: "Missing Firebase session token." });
+    return null;
+  }
+
+  try {
+    return await admin.auth().verifyIdToken(idToken);
+  } catch (error) {
+    console.error("Firebase session verification failed:", error);
+    sendJson(res, 401, { error: "Invalid or expired Firebase session token." });
+    return null;
+  }
+}
+
+async function requireWhatsappAccessContext(req, res) {
+  const decodedToken = await requireAuthenticatedUser(req, res);
+  if (!decodedToken) {
+    return null;
+  }
+
+  const accessToken = await getWorkspaceWhatsappAccessToken(decodedToken.uid);
+  if (!accessToken) {
+    sendJson(res, 401, { error: "No WhatsApp access token provided for this workspace" });
+    return null;
+  }
+
+  return {
+    accessToken,
+    userId: decodedToken.uid
+  };
 }
 
 function getWebhookCallLabel(direction, status) {
@@ -125,6 +225,78 @@ function inferWebhookCallStatus(message, direction, lowerText, structuredMeta) {
   }
 
   return "ringing";
+}
+
+function normalizeWebhookCallSession(raw) {
+  const rawPayload = raw?.call || raw || {};
+  const sdp =
+    rawPayload?.session?.sdp ||
+    rawPayload?.session_description?.sdp ||
+    rawPayload?.sessionDescription?.sdp ||
+    raw?.session?.sdp ||
+    raw?.session_description?.sdp ||
+    raw?.sessionDescription?.sdp;
+  const rawType =
+    rawPayload?.session?.sdp_type ||
+    rawPayload?.session?.sdpType ||
+    rawPayload?.session?.type ||
+    rawPayload?.session_description?.sdp_type ||
+    rawPayload?.session_description?.sdpType ||
+    rawPayload?.session_description?.type ||
+    rawPayload?.sessionDescription?.sdp_type ||
+    rawPayload?.sessionDescription?.sdpType ||
+    rawPayload?.sessionDescription?.type ||
+    raw?.session?.sdp_type ||
+    raw?.session?.sdpType ||
+    raw?.session?.type ||
+    raw?.session_description?.sdp_type ||
+    raw?.session_description?.sdpType ||
+    raw?.session_description?.type ||
+    raw?.sessionDescription?.sdp_type ||
+    raw?.sessionDescription?.sdpType ||
+    raw?.sessionDescription?.type;
+
+  const sdpType = String(rawType || "").toLowerCase();
+  if (!sdp || !sdpType) {
+    return null;
+  }
+
+  if (!["offer", "answer", "pranswer"].includes(sdpType)) {
+    return null;
+  }
+
+  return { sdp, sdpType };
+}
+
+function getWebhookMediaLabel(mediaType) {
+  const normalizedType = String(mediaType || "").toLowerCase();
+  if (normalizedType === "image") return "Image";
+  if (normalizedType === "video") return "Video";
+  if (normalizedType === "audio") return "Audio";
+  if (normalizedType === "document") return "Document";
+  if (normalizedType === "sticker") return "Sticker";
+  return "Media";
+}
+
+function inferWebhookMediaInfo(message) {
+  const mediaTypes = ["image", "video", "audio", "document", "sticker"];
+  for (const mediaType of mediaTypes) {
+    const mediaPayload = message?.[mediaType];
+    if (!mediaPayload?.id) {
+      continue;
+    }
+
+    return {
+      id: mediaPayload.id,
+      type: mediaType,
+      mimeType: mediaPayload.mime_type || "",
+      caption: mediaPayload.caption || "",
+      filename: mediaPayload.filename || "",
+      sha256: mediaPayload.sha256 || ""
+    };
+  }
+
+  return null;
 }
 
 function inferCallInfoFromWebhookMessage(message, contact, metadata) {
@@ -385,6 +557,53 @@ const eventStore = {
   }
 };
 
+const wss = new WebSocketServer({ noServer: true });
+const clients = new Set();
+const clientSessions = new Map();
+
+function sendSocketJson(client, payload) {
+  if (!client || client.readyState !== client.OPEN) {
+    return;
+  }
+
+  client.send(JSON.stringify(payload));
+}
+
+wss.on("connection", (ws) => {
+  clients.add(ws);
+  clientSessions.set(ws, {});
+
+  ws.on("message", (rawMessage) => {
+    try {
+      const payload = JSON.parse(String(rawMessage || ""));
+      if (payload?.type === "register_dashboard") {
+        const nextSession = {
+          userId: typeof payload.userId === "string" && payload.userId ? payload.userId : undefined,
+          phoneNumberId: typeof payload.phoneNumberId === "string" && payload.phoneNumberId ? payload.phoneNumberId : undefined
+        };
+        clientSessions.set(ws, nextSession);
+        sendSocketJson(ws, {
+          type: "call_diagnostics",
+          payload: {
+            kind: "socket_registration",
+            timestamp: Date.now(),
+            userId: nextSession.userId || null,
+            phoneNumberId: nextSession.phoneNumberId || null,
+            note: "Dashboard registered for live webhook routing."
+          }
+        });
+      }
+    } catch {
+      // Ignore non-JSON client messages.
+    }
+  });
+
+  ws.on("close", () => {
+    clients.delete(ws);
+    clientSessions.delete(ws);
+  });
+});
+
 function mapEventToUseCase(sourceObject, field, value) {
   const object = String(sourceObject || "").toLowerCase();
   const normalizedField = String(field || "").toLowerCase();
@@ -472,19 +691,27 @@ function flattenPayloadToEvents(payload) {
 
 function sendJson(res, statusCode, data) {
   const body = JSON.stringify(data);
+  const origin = res.req?.headers?.origin || "*";
   res.writeHead(statusCode, {
     "Content-Type": "application/json",
     "Content-Length": Buffer.byteLength(body),
-    "Access-Control-Allow-Origin": "*"
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Hub-Signature-256",
+    "Access-Control-Allow-Methods": "GET,POST,DELETE,OPTIONS",
+    "Vary": "Origin"
   });
   res.end(body);
 }
 
 function sendText(res, statusCode, text) {
+  const origin = res.req?.headers?.origin || "*";
   res.writeHead(statusCode, {
     "Content-Type": "text/plain; charset=utf-8",
     "Content-Length": Buffer.byteLength(text),
-    "Access-Control-Allow-Origin": "*"
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Hub-Signature-256",
+    "Access-Control-Allow-Methods": "GET,POST,DELETE,OPTIONS",
+    "Vary": "Origin"
   });
   res.end(text);
 }
@@ -556,6 +783,40 @@ function hasValidMetaSignature(req, rawBody) {
   return provided.length === expected.length && crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
 }
 
+async function readJsonBody(req, res) {
+  try {
+    const { parsed } = await parseRequestBody(req);
+    return parsed || {};
+  } catch (error) {
+    sendJson(res, 400, { error: error.message || "Invalid request body." });
+    return null;
+  }
+}
+
+async function fetchGraphJson(url, options = {}) {
+  const response = await fetch(url, options);
+  const responseText = await response.text();
+  const parsed = responseText ? safeJsonParse(responseText, null) : {};
+
+  return {
+    ok: response.ok,
+    status: response.status,
+    headers: response.headers,
+    data: parsed ?? { error: responseText || "Unexpected response from Meta Graph API." }
+  };
+}
+
+function buildGraphUrl(targetPath, searchParams) {
+  const normalizedPath = String(targetPath || "").replace(/^\/+/, "");
+  const graphUrl = new URL(`https://graph.facebook.com/${GRAPH_VERSION}/${normalizedPath}`);
+  if (searchParams) {
+    for (const [key, value] of searchParams.entries()) {
+      graphUrl.searchParams.append(key, value);
+    }
+  }
+  return graphUrl;
+}
+
 async function routeInboundWhatsappEvents(body) {
   if (!db || body?.object !== "whatsapp_business_account") {
     return { routedUsers: 0, acceptedEvents: 0 };
@@ -571,13 +832,17 @@ async function routeInboundWhatsappEvents(body) {
   for (const event of inboundEvents) {
     const { message, contact, metadata } = event;
     const callInfo = inferCallInfoFromWebhookMessage(message, contact, metadata);
+    const callSession = callInfo ? normalizeWebhookCallSession(message) : null;
+    const mediaInfo = inferWebhookMediaInfo(message);
     const messageText =
       callInfo?.label ||
       message?.text?.body ||
       message?.button?.text ||
       message?.interactive?.button_reply?.title ||
       message?.interactive?.list_reply?.title ||
+      mediaInfo?.caption ||
       message?.caption ||
+      (mediaInfo ? `${getWebhookMediaLabel(mediaInfo.type)}${mediaInfo.filename ? `: ${mediaInfo.filename}` : ""}` : "") ||
       "Media/Unsupported Message";
     const messageTimestamp = Number.parseInt(String(message?.timestamp || Date.now()), 10);
     const normalizedTimestamp = Number.isNaN(messageTimestamp)
@@ -591,6 +856,27 @@ async function routeInboundWhatsappEvents(body) {
       console.warn("Inbound message received without metadata.phone_number_id. Skipping Firestore routing.");
       continue;
     }
+
+    const payload = {
+      type: "whatsapp_message",
+      payload: {
+        from: message?.from,
+        text: messageText,
+        timestamp: normalizedTimestamp,
+        name: contact?.profile?.name || message?.from,
+        id: message?.id,
+        callInfo,
+        callId: message?.call?.id || message?.id,
+        callPayload: message?.call || (callInfo ? message : null),
+        session: callSession,
+        mediaInfo,
+        phoneNumberId: targetPhoneNumberId,
+        businessNumber: metadata?.display_phone_number || ""
+      }
+    };
+
+    const matchingClientSessions = Array.from(clientSessions.entries())
+      .filter(([, session]) => session.phoneNumberId === targetPhoneNumberId);
 
     const usersSnapshot = await db.collection("users")
       .where("whatsappCredentials.phoneNumberId", "==", targetPhoneNumberId)
@@ -627,7 +913,7 @@ async function routeInboundWhatsappEvents(body) {
           businessPhoneNumber: metadata?.display_phone_number || "",
           source: "webhook",
           participants: [contact?.profile?.name || message?.from || ""],
-          session: message?.call?.session || message?.session || null,
+          session: callSession,
           rawCallPayload: message?.call || message
         }, { merge: true });
       }
@@ -645,7 +931,16 @@ async function routeInboundWhatsappEvents(body) {
         name: contact?.profile?.name || message?.from || "",
         phoneNumberId: targetPhoneNumberId,
         whatsappId: message?.id || "",
-        ...(callInfo ? { messageKind: "call", callInfo, callPayload: message?.call || message } : {}),
+        ...(mediaInfo ? {
+          messageKind: mediaInfo.type,
+          mediaType: mediaInfo.type,
+          mediaId: mediaInfo.id,
+          mimeType: mediaInfo.mimeType,
+          caption: mediaInfo.caption,
+          filename: mediaInfo.filename,
+          mediaSha256: mediaInfo.sha256
+        } : {}),
+        ...(callInfo ? { messageKind: "call", callInfo, callPayload: message?.call || message, session: callSession } : {}),
         rawPayload: body
       }, { merge: true });
 
@@ -683,6 +978,16 @@ async function routeInboundWhatsappEvents(body) {
           updatedAt: contactTimestampIso
         }, { merge: true });
       }
+
+      if (matchingClientSessions.length) {
+        for (const [client, session] of matchingClientSessions) {
+          sendSocketJson(client, { ...payload, targetUserId: session.userId || null });
+        }
+      } else {
+        for (const client of clients) {
+          sendSocketJson(client, { ...payload, targetUserId: userId });
+        }
+      }
     }
   }
 
@@ -694,12 +999,23 @@ const server = http.createServer(async (req, res) => {
   const pathname = requestUrl.pathname;
 
   if (req.method === "OPTIONS") {
+    const origin = req.headers.origin || "*";
     res.writeHead(204, {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, X-Hub-Signature-256"
+      "Access-Control-Allow-Origin": origin,
+      "Access-Control-Allow-Methods": "GET,POST,DELETE,OPTIONS",
+      "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Hub-Signature-256",
+      "Vary": "Origin"
     });
     return res.end();
+  }
+
+  if (req.method === "GET" && pathname === "/api/health") {
+    return sendJson(res, 200, {
+      status: "ok",
+      app: "connektly-meta-webhook-server",
+      firebaseEnabled: Boolean(db),
+      timestamp: new Date().toISOString()
+    });
   }
 
   if (req.method === "GET" && pathname === "/health") {
@@ -753,6 +1069,265 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  if (req.method === "POST" && pathname === "/api/wa/credentials") {
+    const decodedToken = await requireAuthenticatedUser(req, res);
+    if (!decodedToken) {
+      return;
+    }
+
+    const body = await readJsonBody(req, res);
+    if (!body) {
+      return;
+    }
+
+    const accessToken = String(body?.accessToken || "").trim();
+    const phoneNumberId = String(body?.phoneNumberId || "").trim();
+    const businessAccountId = String(body?.businessAccountId || body?.wabaId || "").trim();
+
+    if (!accessToken || !phoneNumberId || !businessAccountId) {
+      return sendJson(res, 400, { error: "Missing access token, phone number ID, or business account ID." });
+    }
+
+    try {
+      await saveWorkspaceWhatsappSecret(decodedToken.uid, accessToken);
+      await db.collection("users").doc(decodedToken.uid).set({
+        whatsappCredentials: { phoneNumberId, businessAccountId },
+        toolSetup: { whatsapp: true }
+      }, { merge: true });
+
+      return sendJson(res, 200, { ok: true, phoneNumberId, businessAccountId });
+    } catch (error) {
+      console.error("WhatsApp credential save error:", error);
+      return sendJson(res, 500, { error: "Failed to save WhatsApp workspace credentials." });
+    }
+  }
+
+  if (req.method === "DELETE" && pathname === "/api/wa/credentials") {
+    const decodedToken = await requireAuthenticatedUser(req, res);
+    if (!decodedToken) {
+      return;
+    }
+
+    try {
+      await clearWorkspaceWhatsappSecret(decodedToken.uid);
+      await db.collection("users").doc(decodedToken.uid).set({
+        whatsappCredentials: admin.firestore.FieldValue.delete(),
+        toolSetup: { whatsapp: false }
+      }, { merge: true });
+
+      return sendJson(res, 200, { ok: true });
+    } catch (error) {
+      console.error("WhatsApp disconnect error:", error);
+      return sendJson(res, 500, { error: "Failed to disconnect WhatsApp workspace credentials." });
+    }
+  }
+
+  if (req.method === "POST" && pathname === "/api/wa/embedded-signup") {
+    const decodedToken = await requireAuthenticatedUser(req, res);
+    if (!decodedToken) {
+      return;
+    }
+
+    const body = await readJsonBody(req, res);
+    if (!body) {
+      return;
+    }
+
+    const code = String(body?.code || "").trim();
+    const requestedWabaId = String(body?.wabaId || "").trim();
+    const requestedPhoneNumberId = String(body?.phoneNumberId || "").trim();
+    const appId = String(process.env.FACEBOOK_APP_ID || "").trim();
+    const appSecret = String(process.env.FACEBOOK_APP_SECRET || "").trim();
+
+    if (!code || !appId || !appSecret) {
+      return sendJson(res, 400, { error: "Missing code, FACEBOOK_APP_ID, or FACEBOOK_APP_SECRET" });
+    }
+
+    try {
+      const tokenUrl = new URL(`https://graph.facebook.com/${GRAPH_VERSION}/oauth/access_token`);
+      tokenUrl.searchParams.set("client_id", appId);
+      tokenUrl.searchParams.set("client_secret", appSecret);
+      tokenUrl.searchParams.set("code", code);
+
+      const tokenResponse = await fetchGraphJson(tokenUrl);
+      if (!tokenResponse.ok) {
+        return sendJson(res, tokenResponse.status, tokenResponse.data);
+      }
+
+      const accessToken = String(tokenResponse.data?.access_token || "").trim();
+      let wabaId = requestedWabaId;
+      let phoneNumberId = requestedPhoneNumberId;
+
+      if (!wabaId) {
+        const debugUrl = new URL(`https://graph.facebook.com/${GRAPH_VERSION}/debug_token`);
+        debugUrl.searchParams.set("input_token", accessToken);
+        debugUrl.searchParams.set("access_token", `${appId}|${appSecret}`);
+        const debugResponse = await fetchGraphJson(debugUrl);
+        if (!debugResponse.ok) {
+          return sendJson(res, debugResponse.status, debugResponse.data);
+        }
+
+        const granularScopes = debugResponse.data?.data?.granular_scopes;
+        const wabaScope = Array.isArray(granularScopes)
+          ? granularScopes.find((scope) => scope.scope === "whatsapp_business_management" || scope.scope === "whatsapp_business_messaging")
+          : null;
+        wabaId = String(wabaScope?.target_ids?.[0] || "").trim();
+      }
+
+      if (!wabaId) {
+        return sendJson(res, 400, { error: "No WhatsApp Business Account found in the granted scopes." });
+      }
+
+      let phoneNumbers = [];
+      if (!phoneNumberId) {
+        const phoneNumbersUrl = new URL(`https://graph.facebook.com/${GRAPH_VERSION}/${wabaId}/phone_numbers`);
+        phoneNumbersUrl.searchParams.set("access_token", accessToken);
+        const phoneNumbersResponse = await fetchGraphJson(phoneNumbersUrl);
+        if (!phoneNumbersResponse.ok) {
+          return sendJson(res, phoneNumbersResponse.status, phoneNumbersResponse.data);
+        }
+
+        phoneNumbers = Array.isArray(phoneNumbersResponse.data?.data) ? phoneNumbersResponse.data.data : [];
+        phoneNumberId = String(phoneNumbers[0]?.id || "").trim();
+      } else {
+        phoneNumbers = [{ id: phoneNumberId }];
+      }
+
+      await saveWorkspaceWhatsappSecret(decodedToken.uid, accessToken);
+      await db.collection("users").doc(decodedToken.uid).set({
+        whatsappCredentials: {
+          phoneNumberId,
+          businessAccountId: wabaId
+        },
+        toolSetup: { whatsapp: true }
+      }, { merge: true });
+
+      return sendJson(res, 200, { ok: true, wabaId, phoneNumberId, phoneNumbers });
+    } catch (error) {
+      console.error("Embedded signup error:", error);
+      return sendJson(res, 500, { error: error.message || "Failed to process embedded signup" });
+    }
+  }
+
+  if (req.method === "GET" && /^\/api\/wa-media\/[^/]+\/download$/.test(pathname)) {
+    const workspaceContext = await requireWhatsappAccessContext(req, res);
+    if (!workspaceContext) {
+      return;
+    }
+
+    const mediaId = pathname.split("/")[3];
+    try {
+      const metadataUrl = new URL(`https://graph.facebook.com/${GRAPH_VERSION}/${mediaId}`);
+      metadataUrl.searchParams.set("access_token", workspaceContext.accessToken);
+      const metadataResponse = await fetchGraphJson(metadataUrl);
+      if (!metadataResponse.ok) {
+        return sendJson(res, metadataResponse.status, metadataResponse.data);
+      }
+
+      const mediaUrl = String(metadataResponse.data?.url || "");
+      if (!mediaUrl) {
+        return sendJson(res, 404, { error: "Media download URL not found" });
+      }
+
+      const mediaResponse = await fetch(mediaUrl, {
+        headers: {
+          Authorization: `Bearer ${workspaceContext.accessToken}`
+        }
+      });
+
+      const mediaBuffer = Buffer.from(await mediaResponse.arrayBuffer());
+      if (!mediaResponse.ok) {
+        const errorText = mediaBuffer.toString("utf8");
+        return sendJson(res, mediaResponse.status, safeJsonParse(errorText, { error: errorText || "Unable to download media." }));
+      }
+
+      res.writeHead(200, {
+        "Access-Control-Allow-Origin": req.headers.origin || "*",
+        "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Hub-Signature-256",
+        "Access-Control-Allow-Methods": "GET,POST,DELETE,OPTIONS",
+        "Vary": "Origin",
+        "Content-Type": mediaResponse.headers.get("content-type") || metadataResponse.data?.mime_type || "application/octet-stream",
+        "Cache-Control": "private, max-age=300",
+        "Content-Length": mediaBuffer.length
+      });
+      return res.end(mediaBuffer);
+    } catch (error) {
+      console.error("WhatsApp Media Download Error:", error);
+      return sendJson(res, 500, { error: error.message || "Unable to download media." });
+    }
+  }
+
+  if ((req.method === "GET" && /^\/api\/wa\/media\/[^/]+\/download$/.test(pathname)) || (pathname.startsWith("/api/wa/") && !WEBHOOK_PATHS.has(pathname))) {
+    const workspaceContext = await requireWhatsappAccessContext(req, res);
+    if (!workspaceContext) {
+      return;
+    }
+
+    try {
+      if (req.method === "GET" && /^\/api\/wa\/media\/[^/]+\/download$/.test(pathname)) {
+        const mediaId = pathname.split("/")[4];
+        const metadataUrl = new URL(`https://graph.facebook.com/${GRAPH_VERSION}/${mediaId}`);
+        metadataUrl.searchParams.set("access_token", workspaceContext.accessToken);
+        const metadataResponse = await fetchGraphJson(metadataUrl);
+        if (!metadataResponse.ok) {
+          return sendJson(res, metadataResponse.status, metadataResponse.data);
+        }
+
+        const mediaUrl = String(metadataResponse.data?.url || "");
+        if (!mediaUrl) {
+          return sendJson(res, 404, { error: "Media download URL not found" });
+        }
+
+        const mediaResponse = await fetch(mediaUrl, {
+          headers: {
+            Authorization: `Bearer ${workspaceContext.accessToken}`
+          }
+        });
+
+        const mediaBuffer = Buffer.from(await mediaResponse.arrayBuffer());
+        if (!mediaResponse.ok) {
+          const errorText = mediaBuffer.toString("utf8");
+          return sendJson(res, mediaResponse.status, safeJsonParse(errorText, { error: errorText || "Unable to download media." }));
+        }
+
+        res.writeHead(200, {
+          "Access-Control-Allow-Origin": req.headers.origin || "*",
+          "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Hub-Signature-256",
+          "Access-Control-Allow-Methods": "GET,POST,DELETE,OPTIONS",
+          "Vary": "Origin",
+          "Content-Type": mediaResponse.headers.get("content-type") || metadataResponse.data?.mime_type || "application/octet-stream",
+          "Cache-Control": "private, max-age=300",
+          "Content-Length": mediaBuffer.length
+        });
+        return res.end(mediaBuffer);
+      }
+
+      const targetPath = pathname.slice("/api/wa/".length);
+      const graphUrl = buildGraphUrl(targetPath, requestUrl.searchParams);
+      const requestInit = {
+        method: req.method,
+        headers: {
+          Authorization: `Bearer ${workspaceContext.accessToken}`
+        }
+      };
+
+      if (req.method !== "GET" && req.method !== "DELETE") {
+        const body = await readJsonBody(req, res);
+        if (!body) {
+          return;
+        }
+        requestInit.headers["Content-Type"] = "application/json";
+        requestInit.body = JSON.stringify(body);
+      }
+
+      const graphResponse = await fetchGraphJson(graphUrl, requestInit);
+      return sendJson(res, graphResponse.status, graphResponse.data);
+    } catch (error) {
+      console.error("WhatsApp Proxy Error:", error);
+      return sendJson(res, 500, { error: error.message || "WhatsApp proxy request failed." });
+    }
+  }
+
   if (req.method === "GET" && pathname === "/api/stats") {
     return sendJson(res, 200, eventStore.stats());
   }
@@ -772,6 +1347,17 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET") return serveStatic(res, pathname);
 
   return sendJson(res, 404, { error: "Not found" });
+});
+
+server.on("upgrade", (request, socket, head) => {
+  const pathname = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`).pathname;
+  if (pathname === "/ws") {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit("connection", ws, request);
+    });
+  } else {
+    socket.destroy();
+  }
 });
 
 server.listen(PORT, () => {
