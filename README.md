@@ -1,102 +1,53 @@
-# Connektly Meta Webhook Callback URL Server + Event Dashboard
+# Connektly API Backend
 
-A production-ready starter for **Connektly** to receive Meta webhooks and monitor events in a modern dashboard.
+Standalone deployable backend repository for `https://api.connektly.in`.
 
-## Supported use cases
+## What This Repo Includes
 
-1. Create and Manage Ads
-2. Manage Ad Apps
-3. Connect on WhatsApp (Cloud API Platform)
-4. Measure Ad Performance
-5. Capture and Manage Leads
-6. Manage Pages
-7. Instagram API
-8. Messenger from Meta
+- WhatsApp Cloud API proxy routes
+- WhatsApp webhook verification and inbound event routing
+- WebSocket updates for the dashboard
+- Meta embedded signup and Instagram/lead capture callbacks
+- Firebase Admin access for per-user WhatsApp credentials and CRM writes
+- `/api/health` health check for Render or similar hosts
 
-## Features
+## Files
 
-- Meta webhook verification endpoint (`GET /meta/webhook`)
-- Meta webhook callback receiver (`POST /meta/webhook`)
-- Also supports `/api/wa/webhook`, `/api/whatsapp/webhook`, and `/webhook`
-- Event classification to all 8 use-case buckets
-- Flattens multiple `entry[].changes[]` records into individual trackable events
-- Optional Meta signature verification (`X-Hub-Signature-256`) when `META_APP_SECRET` is set
-- Persistent local event storage (`data/events.json`)
-- Optional Firebase Admin routing for inbound WhatsApp events into Connektly user workspaces
-- Modern dashboard with:
-  - Total event count and use-case cards
-  - Source-level visibility
-  - Filterable event stream (by use case + source)
-  - Payload inspector
-- REST APIs:
-  - `GET /api/events?type=&source=&limit=`
-  - `GET /api/stats`
-  - `GET /api/health`
-  - `POST /api/wa/credentials`
-  - `DELETE /api/wa/credentials`
-  - `POST /api/wa/embedded-signup`
-  - `GET /api/wa-media/:mediaId/download`
-  - `ALL /api/wa/*`
-  - `WS /ws`
-  - `GET /health`
+- `server.ts`: Express + WebSocket backend
+- `firebaseAdmin.ts`: Firebase Admin bootstrap
+- `firebase-applet-config.json`: Firebase project metadata
+- `.env.example`: required environment variables
+- `render.yaml`: Render blueprint
 
-## Quick start
+## Local Run
 
-```bash
-cp .env.example .env
-npm run dev
-```
+1. `npm install`
+2. Copy `.env.example` to `.env.local`
+3. Fill in the required env vars
+4. `npm run dev`
 
-Open: `http://localhost:8080`
+Server defaults to `http://127.0.0.1:3000`.
 
-## Environment variables
+## Render Deploy
 
-- `PORT` - service port (default: `8080`)
-- `META_VERIFY_TOKEN` - token used by Meta for webhook subscription verification
-- `WHATSAPP_WEBHOOK_VERIFY_TOKEN` - optional legacy alias for verification token
-- `META_APP_SECRET` - when set, validates incoming `X-Hub-Signature-256`
-- `MAX_EVENTS` - in-memory + persisted rolling event limit
-- `FIREBASE_PROJECT_ID` - Firebase project ID
-- `FIREBASE_FIRESTORE_DATABASE_ID` - named Firestore database ID if you do not use `(default)`
-- `FIREBASE_SERVICE_ACCOUNT_PATH` or `FIREBASE_SERVICE_ACCOUNT_JSON` - Firebase Admin credentials for routing inbound WhatsApp events into Firestore
+1. Create a new Render Web Service from this repository.
+2. Let Render use `render.yaml`.
+3. Set the custom domain to `api.connektly.in`.
+4. Add all required env vars from `.env.example`.
+5. Deploy.
 
-## Meta webhook setup
+## Required Production Values
 
-- Callback URL: `https://<your-domain>/meta/webhook`
-- Verify token: value of `META_VERIFY_TOKEN`
+- `APP_URL=https://app.connektly.in`
+- `API_URL=https://api.connektly.in`
+- `META_VERIFY_TOKEN`
+- `FACEBOOK_APP_ID`
+- `FACEBOOK_APP_SECRET`
+- `FIREBASE_SERVICE_ACCOUNT_JSON` or `FIREBASE_SERVICE_ACCOUNT_PATH`
 
-Verification test:
+## Webhook URLs
 
-```bash
-curl "http://localhost:8080/meta/webhook?hub.mode=subscribe&hub.verify_token=connektly-meta-verify-token&hub.challenge=12345"
-```
+- `https://api.connektly.in/meta/webhook`
+- `https://api.connektly.in/api/wa/webhook`
 
-Expected response: `12345`
-
-## Example webhook call
-
-```bash
-curl -X POST http://localhost:8080/meta/webhook \
-  -H "Content-Type: application/json" \
-  -d '{
-    "object": "whatsapp_business_account",
-    "entry": [{
-      "id": "WABA_ID",
-      "time": 1712050000,
-      "changes": [{
-        "field": "messages",
-        "value": {
-          "messaging_product": "whatsapp",
-          "messages": [{"id": "wamid.HBgL..."}]
-        }
-      }]
-    }]
-  }'
-```
-
-## Production notes
-
-- Keep `META_APP_SECRET` enabled in production.
-- Move event persistence from file storage to a durable DB (e.g., PostgreSQL/Redis).
-- Put the service behind HTTPS and centralized logging/monitoring.
-- For Connektly's inbox to show inbound WhatsApp messages, configure the same Firebase project/database used by the dashboard and provide Firebase Admin credentials so this webhook service can write to `users/{uid}/messages` and `users/{uid}/contacts`.
+Use the same verify token in Meta that you place in `META_VERIFY_TOKEN`.
